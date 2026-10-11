@@ -17,30 +17,56 @@ def compression_loss(tokens, eps=1e-8):
     return off_diagonal.square().sum((-1, -2)).mean()
 
 
-def scatter_statistics(features, labels):
+def layer_scatter(features, labels):
+    """Equations (7)-(8) for a stack of layers at once.
+
+    features: [L, B, d] pooled representations, labels: [B]. Returns the within-class scatter (mean
+    over classes with at least two samples of the summed squared deviations from the class mean) and
+    the between-class scatter (sum over ordered pairs of distinct classes of squared mean distances),
+    each of shape [L], with the number of valid and of all classes in the batch.
+    """
     features = features.float()
-    centers, within = [], []
-    for label in labels.unique(sorted=True):
-        members = features[labels == label]
-        center = members.mean(0)
-        centers.append(center)
-        if members.shape[0] >= 2:
-            within.append((members - center).square().sum())
-    zero = features.sum() * 0
-    intra = torch.stack(within).mean() if within else zero
-    if len(centers) >= 2:
-        means = torch.stack(centers)
-        inter = (means[:, None] - means[None, :]).square().sum()
-    else:
-        inter = zero
-    return intra, inter, len(within), len(centers)
+    classes, inverse, counts = labels.unique(sorted=True, return_inverse=True, return_counts=True)
+    layers, size = features.shape[0], classes.numel()
+    means = features.new_zeros(layers, size, features.shape[-1]).index_add_(1, inverse, features)
+    means = means / counts[None, :, None]
+    deviations = (features - means[:, inverse]).square().sum(-1)
+    within = features.new_zeros(layers, size).index_add_(1, inverse, deviations)
+    valid = counts >= 2
+    num_valid = int(valid.sum())
+    zero = features.sum((1, 2)) * 0
+    intra = within[:, valid].sum(1) / num_valid if num_valid else zero
+    inter = (means[:, :, None] - means[:, None, :]).square().sum((1, 2, 3)) if size >= 2 else zero
+    return intra, inter, num_valid, size
+
+
+def scatter_statistics(features, labels):
+    intra, inter, valid, classes = layer_scatter(features[None], labels)
+    return intra[0], inter[0], valid, classes
+
+
+def layer_sufficiency(features, labels, eps=1e-8):
+    """Equation (9) for a stack of layers [L, B, d]; zero when no class has two samples."""
+    intra, inter, valid, classes = layer_scatter(features, labels)
+    if not valid or classes < 2:
+        return features.float().sum((1, 2)) * 0
+    return intra / (inter + eps)
 
 
 def sufficiency_loss(features, labels, eps=1e-8):
-    intra, inter, valid, classes = scatter_statistics(features, labels)
-    if not valid or classes < 2:
-        return features.float().sum() * 0
-    return intra / (inter + eps)
+    return layer_sufficiency(features[None], labels, eps)[0]
+
+
+def sufficiency_per_layer(pooled, labels, eps=1e-8):
+    """Equation (9) for a list of layers; layers of equal width (all of a ViT, a Swin stage) share one pass."""
+    groups = {}
+    for index, features in enumerate(pooled):
+        groups.setdefault(features.shape[-1], []).append(index)
+    values = [None] * len(pooled)
+    for indices in groups.values():
+        for index, value in zip(indices, layer_sufficiency(torch.stack([pooled[i] for i in indices]), labels, eps)):
+            values[index] = value
+    return torch.stack(values)
 
 
 def layer_schedule(value, depth):
@@ -55,10 +81,11 @@ def layer_schedule(value, depth):
 
 class PIBObjective(nn.Module):
     def __init__(self, depth, compression=None, sufficiency=None, alpha=1.0, delta=0.05,
-                 path_weight=0.1, routing=True, normalization="mean", eps=1e-8):
+                 path_weight=0.1, routing=True, normalization="mean", eps=1e-8, label_smoothing=0.0):
         super().__init__()
-        if depth < 1 or path_weight < 0 or eps <= 0:
-            raise ValueError("Invalid PIB depth, path weight, or epsilon.")
+        if depth < 1 or path_weight < 0 or eps <= 0 or not 0 <= label_smoothing < 1:
+            raise ValueError("Invalid PIB depth, path weight, epsilon, or label smoothing.")
+        self.label_smoothing = float(label_smoothing)  # for the task cross-entropy only
         if normalization not in {"mean", "none"}:
             raise ValueError("normalization must be mean or none.")
         compression = {"start": 0.01, "end": 0.1} if compression is None else compression
@@ -72,13 +99,19 @@ class PIBObjective(nn.Module):
         self.routing_logits = nn.Parameter(torch.zeros(depth)) if routing else None
         self.path_weight = float(path_weight)
         self.normalization, self.eps = normalization, eps
+        # With every regularizer weight at zero (plain prompt tuning) only the task loss counts.
+        self.active = bool(self.compression_weights.any() or self.sufficiency_weights.any() or self.path_weight > 0)
 
     def forward(self, output, labels, regularization_scale=1.0):
+        if not self.active:
+            logits = output["logits"] if isinstance(output, dict) else output
+            task = F.cross_entropy(logits.float(), labels, label_smoothing=self.label_smoothing)
+            return {"loss": task, "task": task}
         states = output["states"]
         if len(states) != self.alpha.numel():
             raise ValueError("Layer states and PIB schedules have different lengths.")
         raw_comp = torch.stack([compression_loss(state.tokens, self.eps) for state in states])
-        raw_suff = torch.stack([sufficiency_loss(state.pooled, labels, self.eps) for state in states])
+        raw_suff = sufficiency_per_layer([state.pooled for state in states], labels, self.eps)
         comp, suff = raw_comp, raw_suff
         if self.normalization == "mean":
             comp = comp / comp.detach().mean().clamp_min(self.eps)
@@ -90,7 +123,7 @@ class PIBObjective(nn.Module):
             weighted = gates * self.compression_weights * comp + (1 - gates) * self.sufficiency_weights * suff
         quality = comp + self.alpha * suff
         path = F.relu(quality[1:] - quality[:-1] - self.delta[:-1]).sum()
-        task = F.cross_entropy(output["logits"].float(), labels)
+        task = F.cross_entropy(output["logits"].float(), labels, label_smoothing=self.label_smoothing)
         regularizer = weighted.sum()
         total = task + regularization_scale * (regularizer + self.path_weight * path)
         return {"loss": total, "task": task, "pib": regularizer, "path": path,

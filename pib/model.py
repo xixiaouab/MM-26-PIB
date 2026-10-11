@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import torch
@@ -57,12 +58,97 @@ def prompted_swin_block(block, x, prompt):
     return (flat + block.drop_path2(block.mlp(block.norm2(flat)))).reshape(batch, height, width, dim)
 
 
+class LowRank(nn.Module):
+    """LoRA update scale * up(down(x)) added to a frozen linear layer's output (zero at initialization)."""
+
+    def __init__(self, in_features, out_features, rank, alpha, dropout=0.0):
+        super().__init__()
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        self.scale = alpha / rank
+        self.dropout = nn.Dropout(dropout)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        return self.up(self.down(self.dropout(x))) * self.scale
+
+
+class Adapter(nn.Module):
+    """Bottleneck scale * up(relu(down(x))) parallel to a block's MLP, as in AdaptFormer (zero at initialization)."""
+
+    def __init__(self, width, dim, scale):
+        super().__init__()
+        self.down = nn.Linear(width, dim)
+        self.up = nn.Linear(dim, width)
+        self.scale = scale
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.down.bias)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x):
+        return self.up(F.relu(self.down(x))) * self.scale
+
+
+class ScaleShift(nn.Module):
+    """SSF: per-channel scale and shift of a frozen layer's output (identity at initialization)."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(width))
+        self.shift = nn.Parameter(torch.zeros(width))
+
+    def forward(self, x):
+        return x * self.scale + self.shift
+
+
+# Layers whose outputs SSF rescales in every block (as in the SSF paper), besides the patch embedding and final norm.
+SSF_TARGETS = {"norm1": lambda block: block.norm1, "qkv": lambda block: block.attn.qkv,
+               "proj": lambda block: block.attn.proj, "norm2": lambda block: block.norm2,
+               "fc1": lambda block: block.mlp.fc1, "fc2": lambda block: block.mlp.fc2}
+
+
+def _transform_output(module):
+    """Forward hook replacing a frozen layer's output by module(output); the module lives outside the backbone."""
+    def hook(layer, inputs, output):
+        return module(output)
+    return hook
+
+
+LORA_TARGETS = {"qkv": lambda block: block.attn.qkv, "proj": lambda block: block.attn.proj,
+                "fc1": lambda block: block.mlp.fc1, "fc2": lambda block: block.mlp.fc2}
+
+
+def _add_to_output(module):
+    """Forward hook adding module(input) to a frozen layer's output; the module lives outside the backbone."""
+    def hook(layer, inputs, output):
+        return output + module(inputs[0])
+    return hook
+
+
 class PromptedVisionTransformer(nn.Module):
+    """Frozen backbone with deep prompts and a trainable head.
+
+    Optional variants (defaults reproduce the plain model): head="mlp" (two-layer MLP head with
+    head_hidden units and head_dropout), features="cls_gap" (class token concatenated with the mean
+    image token), prompt_reparam={"dim", "hidden"} (prompts produced by an MLP shared across layers
+    from per-layer embeddings, as in prefix-tuning; the prompts can be computed once after training),
+    lora={"rank", "alpha", "targets", "dropout"} (low-rank updates of the frozen qkv/proj/fc1/fc2
+    layers of every block), adapter={"dim", "scale"} (a bottleneck parallel to every block's MLP) and
+    ssf=True (per-channel scale and shift after the patch embedding, every block's norms, qkv, proj,
+    fc1 and fc2, and the final norm). These weights are kept outside the backbone, so trainable-only
+    checkpoints hold them.
+    """
+
     def __init__(self, backbone, num_classes, prompt_length=20, prompt_layers="all",
-                 prompt_std=0.02, prompt_dropout=0.0):
+                 prompt_std=0.02, prompt_dropout=0.0, head="linear", head_hidden=768, head_dropout=0.0,
+                 features="cls", prompt_reparam=None, prompt_init="normal", lora=None, adapter=None, ssf=False):
         super().__init__()
         if min(num_classes, prompt_length) < 1 or prompt_std <= 0:
             raise ValueError("Class count, prompt length, and initialization std must be positive.")
+        if head not in {"linear", "mlp"} or features not in {"cls", "cls_gap"}:
+            raise ValueError("head must be linear or mlp; features must be cls or cls_gap.")
         self.backbone = backbone.requires_grad_(False)
         self.is_swin = hasattr(backbone, "layers")
         if self.is_swin:
@@ -80,12 +166,63 @@ class PromptedVisionTransformer(nn.Module):
             raise ValueError("prompt_layers must be a sorted nonempty list of one-based layer indices.")
         if min(self.prompt_layers) < 1 or max(self.prompt_layers) > len(blocks):
             raise ValueError("A prompted layer is outside the backbone depth.")
-        self.prompts = nn.ParameterDict({str(i): nn.Parameter(torch.empty(prompt_length, dimensions[i - 1]))
-                                        for i in self.prompt_layers})
-        for prompt in self.prompts.values():
-            nn.init.normal_(prompt, std=prompt_std)
+        if self.is_swin and (features != "cls" or prompt_reparam or lora or adapter or ssf):
+            raise ValueError("features=cls_gap, prompt_reparam, lora, adapter and ssf are implemented for ViT backbones.")
+        self.lora = self.adapters = self.ssf = None
+        if ssf:
+            width = backbone.num_features
+            self.ssf = nn.ModuleDict({"patch_embed": ScaleShift(width), "norm": ScaleShift(width)})
+            backbone.patch_embed.register_forward_hook(_transform_output(self.ssf["patch_embed"]))
+            backbone.norm.register_forward_hook(_transform_output(self.ssf["norm"]))
+            for layer, block in enumerate(blocks, 1):
+                for target, find in SSF_TARGETS.items():
+                    module = find(block)
+                    channels = module.out_features if isinstance(module, nn.Linear) else module.normalized_shape[0]
+                    self.ssf[f"{layer}_{target}"] = ScaleShift(channels)
+                    module.register_forward_hook(_transform_output(self.ssf[f"{layer}_{target}"]))
+        if lora:
+            rank, targets = int(lora.get("rank", 8)), list(lora.get("targets", ["qkv"]))
+            if rank < 1 or not targets or set(targets) - set(LORA_TARGETS):
+                raise ValueError(f"lora needs a positive rank and targets from {sorted(LORA_TARGETS)}.")
+            self.lora = nn.ModuleDict()
+            for layer, block in enumerate(blocks, 1):
+                for target in targets:
+                    linear = LORA_TARGETS[target](block)
+                    module = LowRank(linear.in_features, linear.out_features, rank,
+                                     float(lora.get("alpha", rank)), float(lora.get("dropout", 0.0)))
+                    self.lora[f"{layer}_{target}"] = module
+                    linear.register_forward_hook(_add_to_output(module))
+        if adapter:
+            self.adapters = nn.ModuleDict()
+            for layer, block in enumerate(blocks, 1):
+                module = Adapter(backbone.num_features, int(adapter.get("dim", 32)), float(adapter.get("scale", 0.1)))
+                self.adapters[str(layer)] = module
+                block.mlp.register_forward_hook(_add_to_output(module))
+        if prompt_reparam:
+            embedding_dim, hidden = int(prompt_reparam.get("dim", 128)), int(prompt_reparam.get("hidden", 512))
+            self.prompt_embeddings = nn.ParameterDict({str(i): nn.Parameter(torch.randn(prompt_length, embedding_dim))
+                                                       for i in self.prompt_layers})
+            self.prompt_mlp = nn.Sequential(nn.Linear(embedding_dim, hidden), nn.Tanh(),
+                                            nn.Linear(hidden, backbone.num_features))
+            self.prompts = None
+        else:
+            self.prompts = nn.ParameterDict({str(i): nn.Parameter(torch.empty(prompt_length, dimensions[i - 1]))
+                                            for i in self.prompt_layers})
+            for layer, prompt in zip(self.prompt_layers, self.prompts.values()):
+                if prompt_init == "xavier":  # VPT: uniform(-a, a), a = sqrt(6 / (3 * patch_area + width))
+                    patch = getattr(getattr(backbone, "patch_embed", None), "patch_size", (16, 16))
+                    bound = math.sqrt(6.0 / (3 * patch[0] * patch[1] + dimensions[layer - 1]))
+                    nn.init.uniform_(prompt, -bound, bound)
+                elif prompt_init == "normal":
+                    nn.init.normal_(prompt, std=prompt_std)
+                else:
+                    raise ValueError("prompt_init must be normal or xavier.")
         self.prompt_dropout = nn.Dropout(prompt_dropout)
-        self.head = nn.Linear(backbone.num_features, num_classes)
+        self.features = features
+        width = backbone.num_features * (2 if features == "cls_gap" else 1)
+        self.head = (nn.Linear(width, num_classes) if head == "linear" else
+                     nn.Sequential(nn.Linear(width, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
+                                   nn.Linear(head_hidden, num_classes)))
         self.backbone.eval()
 
     def train(self, mode=True):
@@ -94,9 +231,11 @@ class PromptedVisionTransformer(nn.Module):
         return self
 
     def _prompt(self, layer, batch):
-        if str(layer) not in self.prompts:
+        if layer not in self.prompt_layers:
             return None
-        return self.prompt_dropout(self.prompts[str(layer)][None].expand(batch, -1, -1))
+        prompt = (self.prompts[str(layer)] if self.prompts is not None
+                  else self.prompt_mlp(self.prompt_embeddings[str(layer)]))
+        return self.prompt_dropout(prompt[None].expand(batch, -1, -1))
 
     def forward(self, images, return_states=False):
         states = []
@@ -127,9 +266,29 @@ class PromptedVisionTransformer(nn.Module):
                     if return_states:
                         states.append(LayerState(layer, x, x[:, 0]))
             final_pooled = x[:, 0]
-            features = backbone.fc_norm(backbone.norm(x)[:, 0])
+            tokens = backbone.norm(x)
+            features = backbone.fc_norm(tokens[:, 0])
+            if self.features == "cls_gap":
+                features = torch.cat((features, tokens[:, prefix:].mean(1)), dim=-1)
         logits = self.head(features)
         return {"logits": logits, "states": states, "final_pooled": final_pooled} if return_states else logits
+
+
+def model_state(model, include_backbone=True):
+    """State dict to checkpoint; the frozen backbone is left out when it can be rebuilt from its weights."""
+    state = model.state_dict()
+    if include_backbone:
+        return state
+    return {key: value for key, value in state.items() if not key.startswith("backbone.")}
+
+
+def load_model_state(model, state, backbone_in_checkpoint=True):
+    if backbone_in_checkpoint:
+        model.load_state_dict(state)
+        return
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected or any(not key.startswith("backbone.") for key in missing):
+        raise ValueError(f"Checkpoint does not match the model: missing={missing[:8]}, unexpected={unexpected[:8]}")
 
 
 def load_backbone_checkpoint(backbone, path):

@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import shutil
+import time
 from pathlib import Path
 
 import torch
@@ -11,7 +12,7 @@ from torch import nn
 import yaml
 
 from .data import build_loaders
-from .model import create_model
+from .model import create_model, load_model_state, model_state
 from .losses import PIBObjective
 from .utils import (atomic_save, load_config, resolve_device, restore_rng,
                     rng_state, seed_everything, write_json)
@@ -49,10 +50,10 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, precision="fp3
             if training:
                 optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, precision):
-                output = model(images, return_states=training)
+                output = model(images, return_states=training and objective.active)
             if training:
                 values = objective(output, labels, regularization_scale)
-                logits = output["logits"]
+                logits = output["logits"] if isinstance(output, dict) else output
             else:
                 logits = output
                 values = {"loss": nn.functional.cross_entropy(logits.float(), labels)}
@@ -80,7 +81,16 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, precision="fp3
             "top1": 100 * correct / count, "samples": count}
 
 
-def run_training(config, output_dir, resume=None, device=None):
+class TrainingPreempted(Exception):
+    """Raised after saving last.pt when the next epoch would not finish before the deadline."""
+
+
+def run_training(config, output_dir, resume=None, device=None, deadline=None):
+    """Train with validation-based checkpoint selection.
+
+    deadline: optional UNIX time; training stops with TrainingPreempted after an epoch's checkpoint
+    when another epoch would not fit, and can be continued exactly with resume=<output>/last.pt.
+    """
     config = copy.deepcopy(config)
     settings = config.setdefault("training", {})
     seed_everything(int(settings.get("seed", 0)))
@@ -100,12 +110,21 @@ def run_training(config, output_dir, resume=None, device=None):
         for section in ("model", "loss", "data"):
             if checkpoint["config"].get(section, {}) != config.get(section, {}):
                 raise ValueError(f"Resume {section} settings differ from the checkpoint.")
-    model = create_model(config, pretrained=False if checkpoint else None).to(device)
+    restore_backbone = bool(checkpoint) and checkpoint.get("backbone_in_checkpoint", True)
+    model = create_model(config, pretrained=False if restore_backbone else None).to(device)
+    # A pretrained frozen backbone is rebuilt from its weights, so checkpoints keep only what is trained.
+    save_backbone = bool(settings.get("save_backbone", not config["model"].get("pretrained", True)))
     objective = PIBObjective(len(model.prompt_layers), **config.get("loss", {})).to(device)
     parameters = [parameter for parameter in list(model.parameters()) + list(objective.parameters())
                   if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=float(settings.get("learning_rate", 1e-3)),
-                                 weight_decay=float(settings.get("weight_decay", 1e-4)))
+    learning_rate, weight_decay = float(settings.get("learning_rate", 1e-3)), float(settings.get("weight_decay", 1e-4))
+    if settings.get("optimizer", "adamw") == "sgd":  # the VPT / VFPT recipe
+        optimizer = torch.optim.SGD(parameters, lr=learning_rate, momentum=float(settings.get("momentum", 0.9)),
+                                    weight_decay=weight_decay)
+    elif settings.get("optimizer", "adamw") == "adamw":
+        optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+    else:
+        raise ValueError("training.optimizer must be adamw or sgd.")
     epochs = int(settings.get("epochs", 100))
     warmup = int(settings.get("warmup_epochs", 10))
     if epochs < 1 or not 0 <= warmup <= epochs:
@@ -116,7 +135,7 @@ def run_training(config, output_dir, resume=None, device=None):
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "fp16")
     start_epoch, best_top1 = 0, -math.inf
     if checkpoint:
-        model.load_state_dict(checkpoint["model"])
+        load_model_state(model, checkpoint["model"], restore_backbone)
         objective.load_state_dict(checkpoint["objective"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -148,6 +167,7 @@ def run_training(config, output_dir, resume=None, device=None):
     print(json.dumps({"device": str(device), "trainable_parameters": trainable,
                       "total_parameters": total, "start_epoch": start_epoch}), flush=True)
     history_path = output_dir / "metrics.jsonl"
+    started = time.time()
     for epoch in range(start_epoch, epochs):
         learning_rate = optimizer.param_groups[0]["lr"]
         regularization_scale = min(1.0, (epoch + 1) / max(1, int(settings.get("regularization_warmup", 10))))
@@ -167,7 +187,8 @@ def run_training(config, output_dir, resume=None, device=None):
             handle.write(json.dumps(record) + "\n")
         state = {
             "format_version": 1, "epoch": epoch, "config": config,
-            "model": model.state_dict(), "objective": objective.state_dict(), "optimizer": optimizer.state_dict(),
+            "model": model_state(model, save_backbone), "backbone_in_checkpoint": save_backbone,
+            "objective": objective.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
             "best_top1": best_top1, "rng": rng_state(),
             "loader_rng": {split: loader.generator.get_state()
@@ -176,6 +197,10 @@ def run_training(config, output_dir, resume=None, device=None):
         atomic_save(state, output_dir / "last.pt")
         if improved:
             atomic_save(state, output_dir / "best.pt")
+        if deadline is not None and epoch + 1 < epochs:
+            epoch_seconds = (time.time() - started) / (epoch + 1 - start_epoch)
+            if time.time() + 1.5 * epoch_seconds > deadline:
+                raise TrainingPreempted(f"stopped after epoch {epoch + 1} of {epochs}")
     result = {"best_val_top1": best_top1, "epochs": epochs,
               "trainable_parameters": trainable, "total_parameters": total,
               "best_checkpoint": str(output_dir / "best.pt"),

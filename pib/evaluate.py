@@ -7,7 +7,8 @@ import torch
 from torch import nn
 
 from .data import build_loader
-from .model import create_model
+from .model import create_model, load_model_state
+from .train import autocast_context
 from .utils import resolve_device, write_json
 
 
@@ -15,8 +16,9 @@ def load_checkpoint_model(checkpoint, device=None):
     device = resolve_device(device)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     config = copy.deepcopy(state["config"])
-    model = create_model(config, pretrained=False)
-    model.load_state_dict(state["model"])
+    with_backbone = state.get("backbone_in_checkpoint", True)
+    model = create_model(config, pretrained=False if with_backbone else None)
+    load_model_state(model, state["model"], with_backbone)
     model.to(device).eval()
     return model, config, device
 
@@ -33,12 +35,14 @@ def evaluate_checkpoint(checkpoint, manifest=None, data_root=None, split="test",
     if batch_size is not None:
         config.setdefault("training", {})["batch_size"] = batch_size
     loader = build_loader(config, split)
+    precision = config.get("training", {}).get("precision", "fp32")
     correct = count = 0
     loss_sum = 0.0
     predictions = []
     with torch.inference_mode():
         for batch in loader:
-            logits = model(batch["images"].to(device))
+            with autocast_context(device, precision):
+                logits = model(batch["images"].to(device, non_blocking=True)).float()
             labels = batch["labels"].to(device)
             loss = nn.functional.cross_entropy(logits, labels, reduction="sum")
             predicted = logits.argmax(-1)

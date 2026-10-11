@@ -29,7 +29,7 @@ class Sample:
     id: str
 
 
-def validate_records(records: Sequence[Sample]) -> None:
+def validate_records(records: Sequence[Sample], verify_files: bool = True) -> None:
     if not records:
         raise ValueError("The dataset contains no images.")
     paths, identifiers = set(), set()
@@ -38,16 +38,17 @@ def validate_records(records: Sequence[Sample]) -> None:
             raise ValueError(f"Unknown split {sample.split!r}; use train, val, or test.")
         if sample.label < 0:
             raise ValueError("Class labels must be nonnegative integers.")
-        path = sample.path.resolve()
+        path = sample.path.resolve() if verify_files else sample.path
         if path in paths or sample.id in identifiers:
             raise ValueError(f"Duplicate image or id across dataset records: {sample.id}")
-        if not path.is_file():
+        if verify_files and not path.is_file():
             raise FileNotFoundError(path)
         paths.add(path)
         identifiers.add(sample.id)
 
 
-def read_manifest(path: str | Path, root: str | Path | None = None) -> list[Sample]:
+def read_manifest(path: str | Path, root: str | Path | None = None, verify_files: bool = True) -> list[Sample]:
+    """Read a path,label,split[,id] CSV. verify_files=False skips per-file checks (slow on large test sets)."""
     path = Path(path).expanduser().resolve()
     image_root = Path(root).expanduser().resolve() if root else path.parent
     records = []
@@ -58,13 +59,15 @@ def read_manifest(path: str | Path, root: str | Path | None = None) -> list[Samp
         for line_number, row in enumerate(reader, start=2):
             image_path = Path(row["path"]).expanduser()
             image_path = image_path if image_path.is_absolute() else image_root / image_path
+            if verify_files:
+                image_path = image_path.resolve()
             try:
                 label = int(row["label"])
             except ValueError as error:
                 raise ValueError(f"Manifest line {line_number}: label must be an integer.") from error
-            records.append(Sample(image_path.resolve(), label, row["split"].strip().lower(),
-                                  row.get("id", "").strip() or str(image_path.resolve())))
-    validate_records(records)
+            records.append(Sample(image_path, label, row["split"].strip().lower(),
+                                  row.get("id", "").strip() or str(image_path)))
+    validate_records(records, verify_files)
     return records
 
 
@@ -165,22 +168,64 @@ def write_manifest(records: Sequence[Sample], path: str | Path,
                              "split": sample.split, "id": sample.id})
 
 
+AUGMENTATIONS = {"rrc", "crop", "flip", "d4", "none"}
+RESIZE_MODES = {"shorter", "square"}
+
+
+class RandomQuarterTurn:
+    """Rotate by a random multiple of 90 degrees (exact, no interpolation); with a random horizontal flip this
+    draws uniformly from the eight symmetries of the square."""
+
+    TURNS = (None, Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        turn = self.TURNS[int(torch.randint(4, (1,)))]
+        return image if turn is None else image.transpose(turn)
+
+
 class ImageTransform:
+    """Image preprocessing.
+
+    augment (training only): "rrc" random resized crop, "crop" resize then random crop (VPT on FGVC),
+    "flip" only a horizontal flip after the evaluation resize, "d4" a random rotation by a multiple of 90
+    degrees and a horizontal flip after the evaluation resize (for images without an up direction: tissue,
+    satellite, retina, texture), "none" no augmentation (VTAB-1k).
+    resize_mode: "shorter" resizes the shorter side to resize_size
+    and center-crops image_size; "square" resizes straight to image_size x image_size.
+    """
+
     def __init__(self, training: bool, image_size: int = 224, resize_size: int = 256,
-                 horizontal_flip: float = 0.5, crop_scale=(0.08, 1.0), mean=IMAGENET_MEAN, std=IMAGENET_STD):
+                 horizontal_flip: float = 0.5, crop_scale=(0.08, 1.0), mean=IMAGENET_MEAN, std=IMAGENET_STD,
+                 augment: str = "rrc", resize_mode: str = "shorter"):
         if image_size < 1 or resize_size < image_size:
             raise ValueError("resize_size must be >= image_size > 0.")
         if not 0 <= horizontal_flip <= 1:
             raise ValueError("horizontal_flip must be in [0, 1].")
+        if augment not in AUGMENTATIONS or resize_mode not in RESIZE_MODES:
+            raise ValueError(f"augment must be one of {sorted(AUGMENTATIONS)}, resize_mode one of {sorted(RESIZE_MODES)}.")
         self.training = training
+        self.augment = augment if training else "none"
+        self.resize_mode = resize_mode
         self.image_size = image_size
         self.resize_size = resize_size
-        self.horizontal_flip = horizontal_flip if training else 0.0
+        self.horizontal_flip = horizontal_flip if self.augment != "none" else 0.0
         self.mean, self.std = tuple(mean), tuple(std)
         self.crop_scale = tuple(crop_scale)
-        self.deterministic = not training
-        operations = ([transforms.RandomResizedCrop(image_size, scale=self.crop_scale, interpolation=InterpolationMode.BICUBIC)]
-                      if training else [transforms.Resize(resize_size, InterpolationMode.BICUBIC), transforms.CenterCrop(image_size)])
+        self.deterministic = self.augment == "none"
+        bicubic = InterpolationMode.BICUBIC
+        resize = (transforms.Resize((image_size, image_size), bicubic) if resize_mode == "square"
+                  else transforms.Resize(resize_size, bicubic))
+        if self.augment == "rrc":
+            operations = [transforms.RandomResizedCrop(image_size, scale=self.crop_scale, interpolation=bicubic)]
+        elif self.augment == "crop":
+            operations = [resize, transforms.RandomCrop(image_size)]
+        elif self.augment == "flip":  # same geometry as evaluation, mirrored half of the time
+            operations = [resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)]
+        elif self.augment == "d4":  # same geometry as evaluation, then one of the square's eight symmetries
+            operations = ([resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)])
+            operations.append(RandomQuarterTurn())
+        else:
+            operations = [resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)]
         if self.horizontal_flip:
             operations.append(transforms.RandomHorizontalFlip(self.horizontal_flip))
         self.spatial = transforms.Compose(operations)
@@ -192,25 +237,52 @@ class ImageTransform:
         return TF.normalize(TF.to_tensor(image), self.mean, self.std)
 
     def settings(self) -> dict:
-        return {"training": self.training, "image_size": self.image_size,
-                "resize_size": self.resize_size, "horizontal_flip": self.horizontal_flip,
-                "mean": self.mean, "std": self.std, "interpolation": "bicubic"}
+        return {"training": self.training, "augment": self.augment, "resize_mode": self.resize_mode,
+                "image_size": self.image_size, "resize_size": self.resize_size,
+                "horizontal_flip": self.horizontal_flip, "mean": self.mean, "std": self.std,
+                "interpolation": "bicubic"}
+
+
+def transform_from_config(data: Mapping, training: bool) -> ImageTransform:
+    augment = data.get("augment", "rrc")
+    if isinstance(augment, bool):
+        augment = "rrc" if augment else "none"
+    return ImageTransform(training, int(data.get("image_size", 224)), int(data.get("resize_size", 256)),
+                          float(data.get("horizontal_flip", 0.5)), data.get("crop_scale", (0.08, 1.0)),
+                          data.get("mean", IMAGENET_MEAN), data.get("std", IMAGENET_STD),
+                          augment, data.get("resize_mode", "shorter"))
 
 
 class ImageDataset(Dataset):
-    def __init__(self, records, transform, num_classes=None):
+    def __init__(self, records, transform, num_classes=None, cache=False):
         self.records = list(records)
         self.transform = transform
         self.num_classes = num_classes or max((item.label for item in records), default=-1) + 1
+        # With a deterministic transform the preprocessed image never changes, so it is decoded once; with a
+        # random transform the decoded image is kept and only the random augmentation is redone (no rereads).
+        self.cache = {} if cache and transform.deterministic else None
+        self.decoded = {} if cache and not transform.deterministic else None
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, index):
         sample = self.records[index]
-        with Image.open(sample.path) as image:
-            view = self.transform(image)
-        return {"images": self.transform.normalize(view), "labels": sample.label, "ids": sample.id}
+        view = self.cache.get(index) if self.cache is not None else None
+        if view is None:
+            if self.decoded is not None:
+                image = self.decoded.get(index)
+                if image is None:
+                    with Image.open(sample.path) as stored:
+                        image = self.decoded[index] = stored.convert("RGB")
+                view = TF.pil_to_tensor(self.transform(image))
+            else:
+                with Image.open(sample.path) as image:
+                    view = TF.pil_to_tensor(self.transform(image))
+            if self.cache is not None:
+                self.cache[index] = view
+        images = TF.normalize(view.float().div_(255), self.transform.mean, self.transform.std)
+        return {"images": images, "labels": sample.label, "ids": sample.id}
 
 
 class ClassBalancedBatchSampler(Sampler):
@@ -257,7 +329,7 @@ class ClassBalancedBatchSampler(Sampler):
 def dataset_records(config: Mapping) -> list[Sample]:
     data = config.get("data", {})
     if data.get("manifest"):
-        records = read_manifest(data["manifest"], data.get("root"))
+        records = read_manifest(data["manifest"], data.get("root"), bool(data.get("verify_files", True)))
     elif data.get("root"):
         records = scan_imagefolder(data["root"])
     else:
@@ -278,15 +350,16 @@ def _loader(config: Mapping, records: Sequence[Sample], split: str) -> DataLoade
     selected = [sample for sample in records if sample.split == split]
     if not selected:
         raise ValueError(f"The dataset has no {split!r} samples.")
-    transform = ImageTransform(split == "train", int(data.get("image_size", 224)),
-                               int(data.get("resize_size", 256)), float(data.get("horizontal_flip", 0.5)),
-                               data.get("crop_scale", (0.08, 1.0)), data.get("mean", IMAGENET_MEAN), data.get("std", IMAGENET_STD))
+    transform = transform_from_config(data, split == "train")
     num_classes = max(sample.label for sample in records) + 1
-    dataset = ImageDataset(selected, transform, num_classes)
+    cache = bool(data.get("cache_in_memory", False)) and split in {"train", "val"} and transform.deterministic
+    dataset = ImageDataset(selected, transform, num_classes, cache=cache)
     seed = int(config.get("seed", training.get("seed", 42)))
     workers = int(data.get("num_workers", 4))
     generator = torch.Generator().manual_seed(seed)
     batch_size = int(training.get("batch_size", data.get("batch_size", 64)))
+    if split != "train":
+        batch_size = int(data.get("eval_batch_size", batch_size))
     options = {"num_workers": workers,
                "pin_memory": bool(data.get("pin_memory", torch.cuda.is_available())),
                "persistent_workers": bool(data.get("persistent_workers", False)) and workers > 0,
