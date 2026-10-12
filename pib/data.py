@@ -48,7 +48,6 @@ def validate_records(records: Sequence[Sample], verify_files: bool = True) -> No
 
 
 def read_manifest(path: str | Path, root: str | Path | None = None, verify_files: bool = True) -> list[Sample]:
-    """Read a path,label,split[,id] CSV. verify_files=False skips per-file checks (slow on large test sets)."""
     path = Path(path).expanduser().resolve()
     image_root = Path(root).expanduser().resolve() if root else path.parent
     records = []
@@ -168,14 +167,11 @@ def write_manifest(records: Sequence[Sample], path: str | Path,
                              "split": sample.split, "id": sample.id})
 
 
-AUGMENTATIONS = {"rrc", "crop", "flip", "d4", "none"}
+AUGMENTATIONS = {"rrc", "flip", "d4", "none"}
 RESIZE_MODES = {"shorter", "square"}
 
 
 class RandomQuarterTurn:
-    """Rotate by a random multiple of 90 degrees (exact, no interpolation); with a random horizontal flip this
-    draws uniformly from the eight symmetries of the square."""
-
     TURNS = (None, Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270)
 
     def __call__(self, image: Image.Image) -> Image.Image:
@@ -184,16 +180,6 @@ class RandomQuarterTurn:
 
 
 class ImageTransform:
-    """Image preprocessing.
-
-    augment (training only): "rrc" random resized crop, "crop" resize then random crop (VPT on FGVC),
-    "flip" only a horizontal flip after the evaluation resize, "d4" a random rotation by a multiple of 90
-    degrees and a horizontal flip after the evaluation resize (for images without an up direction: tissue,
-    satellite, retina, texture), "none" no augmentation (VTAB-1k).
-    resize_mode: "shorter" resizes the shorter side to resize_size
-    and center-crops image_size; "square" resizes straight to image_size x image_size.
-    """
-
     def __init__(self, training: bool, image_size: int = 224, resize_size: int = 256,
                  horizontal_flip: float = 0.5, crop_scale=(0.08, 1.0), mean=IMAGENET_MEAN, std=IMAGENET_STD,
                  augment: str = "rrc", resize_mode: str = "shorter"):
@@ -217,15 +203,10 @@ class ImageTransform:
                   else transforms.Resize(resize_size, bicubic))
         if self.augment == "rrc":
             operations = [transforms.RandomResizedCrop(image_size, scale=self.crop_scale, interpolation=bicubic)]
-        elif self.augment == "crop":
-            operations = [resize, transforms.RandomCrop(image_size)]
-        elif self.augment == "flip":  # same geometry as evaluation, mirrored half of the time
-            operations = [resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)]
-        elif self.augment == "d4":  # same geometry as evaluation, then one of the square's eight symmetries
-            operations = ([resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)])
-            operations.append(RandomQuarterTurn())
         else:
             operations = [resize] if resize_mode == "square" else [resize, transforms.CenterCrop(image_size)]
+            if self.augment == "d4":
+                operations.append(RandomQuarterTurn())
         if self.horizontal_flip:
             operations.append(transforms.RandomHorizontalFlip(self.horizontal_flip))
         self.spatial = transforms.Compose(operations)
@@ -258,10 +239,7 @@ class ImageDataset(Dataset):
         self.records = list(records)
         self.transform = transform
         self.num_classes = num_classes or max((item.label for item in records), default=-1) + 1
-        # With a deterministic transform the preprocessed image never changes, so it is decoded once; with a
-        # random transform the decoded image is kept and only the random augmentation is redone (no rereads).
         self.cache = {} if cache and transform.deterministic else None
-        self.decoded = {} if cache and not transform.deterministic else None
 
     def __len__(self):
         return len(self.records)
@@ -270,15 +248,8 @@ class ImageDataset(Dataset):
         sample = self.records[index]
         view = self.cache.get(index) if self.cache is not None else None
         if view is None:
-            if self.decoded is not None:
-                image = self.decoded.get(index)
-                if image is None:
-                    with Image.open(sample.path) as stored:
-                        image = self.decoded[index] = stored.convert("RGB")
+            with Image.open(sample.path) as image:
                 view = TF.pil_to_tensor(self.transform(image))
-            else:
-                with Image.open(sample.path) as image:
-                    view = TF.pil_to_tensor(self.transform(image))
             if self.cache is not None:
                 self.cache[index] = view
         images = TF.normalize(view.float().div_(255), self.transform.mean, self.transform.std)

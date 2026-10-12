@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 data/
 outputs/
+runs/
 checkpoints/
 *.pt
 *.pth

@@ -1,18 +1,3 @@
-"""Lossless copies of VTAB-1k tasks whose common release re-encodes small images as JPEG.
-
-The common VTAB-1k release stores, e.g., CIFAR-100 and SVHN as 32 x 32 JPEG files, while TFDS (used by
-VPT and VFPT) serves the original pixels. Each stored image of the train800 / val200 / train800val200 /
-test lists is matched to the original image with the same label and the smallest mean absolute pixel
-difference, searching the official split the list was drawn from (TFDS shuffles examples when it builds a
-dataset, so the VTAB subsets cannot be recovered by index). A match is trusted when it is close, clearly
-better than the runner-up, and its original is used once in the list; trusted images are written with the
-original pixels and the rest keep the decoded JPEG pixels, so the lists, order and labels are unchanged.
-The copy is abandoned if more than 2% of a list is untrusted. The manifests <task>_png_800.csv and
-<task>_png_1000.csv mirror <task>_800.csv and <task>_1000.csv row by row. smallNORB follows the VTAB
-splits: train800 from the official training set, val200 and test from the official test set (camera 0,
-azimuth label = azimuth / 2), matched in grayscale.
-"""
-
 import argparse
 import csv
 import gzip
@@ -23,11 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-P = "/lustre/orion/csc662/proj-shared/xxiao/PIB"
-
-
 def match(queries, query_labels, originals, original_labels):
-    """Index of the closest same-label original for each query, its distance and the runner-up distance."""
     queries, originals = queries.reshape(len(queries), -1).astype(np.float32), originals.reshape(len(originals), -1)
     by_label = {label: np.flatnonzero(original_labels == label) for label in np.unique(original_labels)}
     index = np.empty(len(queries), dtype=np.int64)
@@ -42,7 +23,6 @@ def match(queries, query_labels, originals, original_labels):
 
 
 def trusted(index, best, second, max_distance=20.0, min_ratio=2.0, min_gap=4.0):
-    """Matches that are close, clearly better than the runner-up, and whose original is used only once."""
     keep = (best <= max_distance) & (second >= np.maximum(min_ratio * best, best + min_gap))
     values, counts = np.unique(index, return_counts=True)
     return keep & ~np.isin(index, values[counts > 1])
@@ -53,7 +33,7 @@ def load_cifar(data):
         with open(path, "rb") as handle:
             batch = pickle.load(handle, encoding="bytes")
         return batch[b"data"].reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1), np.array(batch[b"fine_labels"])
-    base = data / "images/cifar100/cifar-100-python"
+    base = data / "raw/cifar-100-python"
     return {"train": load(base / "train"), "test": load(base / "test")}
 
 
@@ -62,12 +42,11 @@ def load_svhn(data):
 
     def load(path):
         mat = loadmat(path)
-        return np.ascontiguousarray(mat["X"].transpose(3, 0, 1, 2)), mat["y"][:, 0] % 10  # label 10 is digit 0
+        return np.ascontiguousarray(mat["X"].transpose(3, 0, 1, 2)), mat["y"][:, 0] % 10
     return {"train": load(data / "raw/svhn_train_32x32.mat"), "test": load(data / "raw/svhn_test_32x32.mat")}
 
 
 def read_norb(path):
-    """A matrix in the smallNORB binary format (gzip-compressed)."""
     with gzip.open(path) as handle:
         magic, ndim = np.frombuffer(handle.read(8), dtype="<i4")
         dims = np.frombuffer(handle.read(4 * max(3, int(ndim))), dtype="<i4")[:ndim]
@@ -83,12 +62,8 @@ def load_smallnorb(data, attribute):
     return {"train": load("training", "5x46789x9x18x6x2x96x96"), "test": load("testing", "5x01235x9x18x6x2x96x96")}
 
 
-TRAIN_LISTS = {"test": ("test",)}  # every other list comes from the official training split
+TRAIN_LISTS = {"test": ("test",)}
 NORB_LISTS = {"train800": ("train",), "val200": ("test",), "train800val200": ("train", "test"), "test": ("test",)}
-# task -> (loader, image mode, list sources, minimum distance gap to the runner-up). The gap only guards
-# against exact duplicates; the runner-up must also be twice as far. smallNORB images are smooth grayscale
-# photographs whose JPEG error is about 1 (CIFAR and SVHN: about 6), and the same pose under another
-# lighting is a close runner-up, so its absolute gap is smaller.
 TASKS = {"cifar": (load_cifar, "RGB", TRAIN_LISTS, 4.0), "svhn": (load_svhn, "RGB", TRAIN_LISTS, 4.0),
          "smallnorb_azi": (lambda data: load_smallnorb(data, "azimuth"), "L", NORB_LISTS, 0.5),
          "smallnorb_ele": (lambda data: load_smallnorb(data, "elevation"), "L", NORB_LISTS, 0.5)}
@@ -100,14 +75,9 @@ def read_rows(path):
 
 
 def build(task, originals, data, mode="RGB", sources=TRAIN_LISTS, min_gap=4.0):
-    """Write the lossless copy of one task and its manifests; returns the per-list matching summary.
-
-    sources maps a list directory (train800, val200, train800val200, test) to the official splits its
-    images were drawn from; lists not named come from the training split.
-    """
     root, manifests = data / "vtab-1k", data / "vtab_manifests"
     tables = {protocol: read_rows(manifests / f"{task}_{protocol}.csv") for protocol in ("800", "1000")}
-    lists = {}  # list directory -> {path: label}, each stored image once
+    lists = {}
     for rows in tables.values():
         for row in rows:
             lists.setdefault(Path(row["path"]).parent.name, {})[row["path"]] = int(row["label"])
@@ -146,13 +116,10 @@ def build(task, originals, data, mode="RGB", sources=TRAIN_LISTS, min_gap=4.0):
     return summary
 
 
-# Tasks whose stored images are byte-identical to another task's (VTAB builds both smallNORB tasks from the
-# same examples); their lossless copy reuses that task's images with their own labels.
 SAME_IMAGES = {"smallnorb_ele": "smallnorb_azi"}
 
 
 def build_alias(task, source, data):
-    """Manifests for `task` pointing at the lossless images of `source`, after checking the stored images match."""
     root, manifests = data / "vtab-1k", data / "vtab_manifests"
     checked, mapping = set(), {}
     for protocol in ("800", "1000"):
@@ -176,9 +143,9 @@ def build_alias(task, source, data):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=sorted(TASKS), required=True)
-    parser.add_argument("--data", default=P + "/data")
+    parser.add_argument("--data", default="data")
     args = parser.parse_args()
     data = Path(args.data)
     if args.task in SAME_IMAGES:

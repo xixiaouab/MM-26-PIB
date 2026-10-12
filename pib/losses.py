@@ -18,13 +18,6 @@ def compression_loss(tokens, eps=1e-8):
 
 
 def layer_scatter(features, labels):
-    """Equations (7)-(8) for a stack of layers at once.
-
-    features: [L, B, d] pooled representations, labels: [B]. Returns the within-class scatter (mean
-    over classes with at least two samples of the summed squared deviations from the class mean) and
-    the between-class scatter (sum over ordered pairs of distinct classes of squared mean distances),
-    each of shape [L], with the number of valid and of all classes in the batch.
-    """
     features = features.float()
     classes, inverse, counts = labels.unique(sorted=True, return_inverse=True, return_counts=True)
     layers, size = features.shape[0], classes.numel()
@@ -46,7 +39,6 @@ def scatter_statistics(features, labels):
 
 
 def layer_sufficiency(features, labels, eps=1e-8):
-    """Equation (9) for a stack of layers [L, B, d]; zero when no class has two samples."""
     intra, inter, valid, classes = layer_scatter(features, labels)
     if not valid or classes < 2:
         return features.float().sum((1, 2)) * 0
@@ -58,7 +50,6 @@ def sufficiency_loss(features, labels, eps=1e-8):
 
 
 def sufficiency_per_layer(pooled, labels, eps=1e-8):
-    """Equation (9) for a list of layers; layers of equal width (all of a ViT, a Swin stage) share one pass."""
     groups = {}
     for index, features in enumerate(pooled):
         groups.setdefault(features.shape[-1], []).append(index)
@@ -85,7 +76,7 @@ class PIBObjective(nn.Module):
         super().__init__()
         if depth < 1 or path_weight < 0 or eps <= 0 or not 0 <= label_smoothing < 1:
             raise ValueError("Invalid PIB depth, path weight, epsilon, or label smoothing.")
-        self.label_smoothing = float(label_smoothing)  # for the task cross-entropy only
+        self.label_smoothing = float(label_smoothing)
         if normalization not in {"mean", "none"}:
             raise ValueError("normalization must be mean or none.")
         compression = {"start": 0.01, "end": 0.1} if compression is None else compression
@@ -99,7 +90,6 @@ class PIBObjective(nn.Module):
         self.routing_logits = nn.Parameter(torch.zeros(depth)) if routing else None
         self.path_weight = float(path_weight)
         self.normalization, self.eps = normalization, eps
-        # With every regularizer weight at zero (plain prompt tuning) only the task loss counts.
         self.active = bool(self.compression_weights.any() or self.sufficiency_weights.any() or self.path_weight > 0)
 
     def forward(self, output, labels, regularization_scale=1.0):

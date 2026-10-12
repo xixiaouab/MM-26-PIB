@@ -4,7 +4,6 @@ import copy
 import json
 import math
 import shutil
-import time
 from pathlib import Path
 
 import torch
@@ -81,16 +80,7 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, precision="fp3
             "top1": 100 * correct / count, "samples": count}
 
 
-class TrainingPreempted(Exception):
-    """Raised after saving last.pt when the next epoch would not finish before the deadline."""
-
-
-def run_training(config, output_dir, resume=None, device=None, deadline=None):
-    """Train with validation-based checkpoint selection.
-
-    deadline: optional UNIX time; training stops with TrainingPreempted after an epoch's checkpoint
-    when another epoch would not fit, and can be continued exactly with resume=<output>/last.pt.
-    """
+def run_training(config, output_dir, resume=None, device=None):
     config = copy.deepcopy(config)
     settings = config.setdefault("training", {})
     seed_everything(int(settings.get("seed", 0)))
@@ -112,13 +102,12 @@ def run_training(config, output_dir, resume=None, device=None, deadline=None):
                 raise ValueError(f"Resume {section} settings differ from the checkpoint.")
     restore_backbone = bool(checkpoint) and checkpoint.get("backbone_in_checkpoint", True)
     model = create_model(config, pretrained=False if restore_backbone else None).to(device)
-    # A pretrained frozen backbone is rebuilt from its weights, so checkpoints keep only what is trained.
     save_backbone = bool(settings.get("save_backbone", not config["model"].get("pretrained", True)))
     objective = PIBObjective(len(model.prompt_layers), **config.get("loss", {})).to(device)
     parameters = [parameter for parameter in list(model.parameters()) + list(objective.parameters())
                   if parameter.requires_grad]
     learning_rate, weight_decay = float(settings.get("learning_rate", 1e-3)), float(settings.get("weight_decay", 1e-4))
-    if settings.get("optimizer", "adamw") == "sgd":  # the VPT / VFPT recipe
+    if settings.get("optimizer", "adamw") == "sgd":
         optimizer = torch.optim.SGD(parameters, lr=learning_rate, momentum=float(settings.get("momentum", 0.9)),
                                     weight_decay=weight_decay)
     elif settings.get("optimizer", "adamw") == "adamw":
@@ -167,7 +156,6 @@ def run_training(config, output_dir, resume=None, device=None, deadline=None):
     print(json.dumps({"device": str(device), "trainable_parameters": trainable,
                       "total_parameters": total, "start_epoch": start_epoch}), flush=True)
     history_path = output_dir / "metrics.jsonl"
-    started = time.time()
     for epoch in range(start_epoch, epochs):
         learning_rate = optimizer.param_groups[0]["lr"]
         regularization_scale = min(1.0, (epoch + 1) / max(1, int(settings.get("regularization_warmup", 10))))
@@ -197,10 +185,6 @@ def run_training(config, output_dir, resume=None, device=None, deadline=None):
         atomic_save(state, output_dir / "last.pt")
         if improved:
             atomic_save(state, output_dir / "best.pt")
-        if deadline is not None and epoch + 1 < epochs:
-            epoch_seconds = (time.time() - started) / (epoch + 1 - start_epoch)
-            if time.time() + 1.5 * epoch_seconds > deadline:
-                raise TrainingPreempted(f"stopped after epoch {epoch + 1} of {epochs}")
     result = {"best_val_top1": best_top1, "epochs": epochs,
               "trainable_parameters": trainable, "total_parameters": total,
               "best_checkpoint": str(output_dir / "best.pt"),

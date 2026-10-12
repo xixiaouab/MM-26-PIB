@@ -1,0 +1,54 @@
+model:
+  backbone: vit_base_patch16_224.orig_in21k
+  pretrained: true
+  prompt_length: 50
+  prompt_layers: all
+  prompt_std: 0.02
+  prompt_dropout: 0.0
+  num_classes: 5
+data:
+  root: data/vtab-1k
+  manifest: data/vtab_manifests/diabetic_retinopathy_1000.csv
+  protocol: official
+  image_size: 224
+  resize_size: 224
+  augment: flip
+  resize_mode: square
+  mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  std:
+  - 0.5
+  - 0.5
+  - 0.5
+  num_workers: 6
+  persistent_workers: true
+  cache_in_memory: true
+  verify_files: false
+  eval_batch_size: 256
+training:
+  seed: 0
+  epochs: 100
+  batch_size: 64
+  balanced_batches: true
+  samples_per_class: 2
+  learning_rate: 0.01
+  weight_decay: 0.0001
+  warmup_epochs: 10
+  regularization_warmup: 10
+  precision: bf16
+  gradient_clip: null
+loss:
+  compression:
+    start: 0.01
+    end: 0.1
+  sufficiency:
+    start: 0.1
+    end: 0.01
+  alpha: 1.0
+  delta: 0.05
+  path_weight: 0.1
+  routing: true
+  normalization: mean
+  eps: 1.0e-08
